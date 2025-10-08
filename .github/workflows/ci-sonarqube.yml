@@ -28,6 +28,15 @@ jobs:
         run: |
           npm run test:cov
 
+      - name: Install curl and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+
+      - name: Pre-pull SonarQube image
+        run: |
+          docker pull sonarqube:latest
+
       - name: Start SonarQube in Docker
         run: |
           docker run -d --name sonarqube -p 9000:9000 -v sonarqube_data:/opt/sonarqube/data sonarqube:latest
@@ -36,25 +45,37 @@ jobs:
         shell: bash
         run: |
           set -e
-          echo "Waiting for SonarQube health..."
-          for i in {1..60}; do
-            STATUS=$(curl -s http://localhost:9000/api/system/health | sed -n 's/.*"health":"\([A-Z]*\)".*/\1/p') || true
-            echo "Attempt $i - Health: $STATUS"
+          echo "Waiting for SonarQube status..."
+          sleep 10
+          STATUS=""
+          for i in {1..120}; do
+            STATUS=$(curl -sS --max-time 2 http://localhost:9000/api/system/status 2>/dev/null | jq -r '.status // empty') || true
+            echo "Attempt $i - Status: ${STATUS:-<no-response>}"
             if [ "$STATUS" = "UP" ]; then
               break
             fi
             sleep 5
           done
           if [ "$STATUS" != "UP" ]; then
-            echo "SonarQube did not become UP in time" >&2
-            docker logs sonarqube || true
+            echo "Primary wait timeout. Checking container logs for 'SonarQube is operational'..." >&2
+            docker logs --tail 500 sonarqube | tee /tmp/sonar_logs.txt || true
+            if grep -q "SonarQube is operational" /tmp/sonar_logs.txt; then
+              echo "Logs indicate SonarQube is operational. Performing grace polling..."
+              for j in {1..12}; do
+                STATUS=$(curl -sS --max-time 2 http://localhost:9000/api/system/status 2>/dev/null | jq -r '.status // empty') || true
+                echo "Grace Attempt $j - Status: ${STATUS:-<no-response>}"
+                if [ "$STATUS" = "UP" ]; then
+                  break
+                fi
+                sleep 5
+              done
+            fi
+          fi
+          if [ "$STATUS" != "UP" ]; then
+            echo "SonarQube did not become UP after grace period" >&2
+            docker logs --tail 200 sonarqube || true
             exit 1
           fi
-
-      - name: Install curl and jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl jq
 
       - name: Initialize admin password (idempotent)
         shell: bash
@@ -112,4 +133,3 @@ jobs:
         run: |
           docker stop sonarqube || true
           docker rm sonarqube || true
-
