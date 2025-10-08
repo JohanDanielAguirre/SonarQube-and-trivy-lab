@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-smoke:
+    runs-on: ubuntu-latest
+
+    env:
+      NODE_VERSION: '20.x'
+
+      MONGO_INITDB_ROOT_USERNAME: ${{ secrets.MONGO_INITDB_ROOT_USERNAME || vars.MONGO_INITDB_ROOT_USERNAME || 'qualifica' }}
+      MONGO_INITDB_ROOT_PASSWORD: ${{ secrets.MONGO_INITDB_ROOT_PASSWORD || secrets.MONGO_INITDB_ROOT_PASSWOD || vars.MONGO_INITDB_ROOT_PASSWORD || 'qualifica' }}
+      MONGO_INITDB_DATABASE:       ${{ secrets.MONGO_INITDB_DATABASE       || vars.MONGO_INITDB_DATABASE       || 'qualifica-professor' }}
+      PORT: 3000
+      JWT_SECRET: ci-secret
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Compute MONGODB_URI
+        run: |
+          if [ -z "${MONGO_INITDB_ROOT_USERNAME}" ] || [ -z "${MONGO_INITDB_ROOT_PASSWORD}" ]; then
+            echo "Variables de credenciales de Mongo no definidas. Configure Secrets o Variables: MONGO_INITDB_ROOT_USERNAME / MONGO_INITDB_ROOT_PASSWORD" >&2
+            exit 1
+          fi
+          DB_NAME=${MONGO_INITDB_DATABASE:-qualifica-professor}
+          echo "MONGODB_URI=mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@localhost:27017/${DB_NAME}?authSource=admin" >> $GITHUB_ENV
+
+      - name: Create .env.db for Docker Compose
+        run: |
+          printf "MONGO_INITDB_ROOT_USERNAME=%s\n" "${MONGO_INITDB_ROOT_USERNAME}" > .env.db
+          printf "MONGO_INITDB_ROOT_PASSWORD=%s\n" "${MONGO_INITDB_ROOT_PASSWORD}" >> .env.db
+          printf "MONGO_INITDB_DATABASE=%s\n" "${MONGO_INITDB_DATABASE}" >> .env.db
+          echo "Generado .env.db con credenciales para Docker Compose"
+
+      - name: Start MongoDB with Docker Compose
+        run: |
+          docker compose version
+          docker compose up -d --quiet-pull --wait
+
+      - name: Show Docker status
+        run: |
+          docker ps -a
+          docker compose ps
+
+      - name: Seed database (small, deterministic)
+        env:
+          SEED_RESET: 'true'
+          SEED_USERS: '2'
+          SEED_UNIVERSITIES: '2'
+          SEED_PROFESSORS: '2'
+          SEED_STUDENTS: '2'
+          SEED_COMMENTS: '2'
+          FAKER_SEED: '1'
+        run: |
+          node dist/scripts/seed.js
+
+      - name: Detectar si hay pruebas
+        id: has_tests
+        run: |
+          COUNT=$(git --no-pager ls-files | grep -E -c "(^|/)(__tests__/.*\.(ts|js)$|.*\.(test|spec)\.(ts|js)$)" || true)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "HAS_TESTS=true" >> $GITHUB_ENV
+            echo "Se detectaron $COUNT archivos de prueba"
+          else
+            echo "HAS_TESTS=false" >> $GITHUB_ENV
+            echo "No se detectaron archivos de prueba"
+          fi
+
+      - name: Run tests with coverage (threshold 81%)
+        run: |
+          if [ "${HAS_TESTS}" = "true" ]; then
+            npm run test:cov
+          else
+            echo "No hay pruebas; se aprueba este paso sin ejecutar cobertura (compatibilidad pedida)."
+          fi
+
+      - name: Start application (background)
+        run: |
+          node dist/server.js &
+          echo $! > app.pid
+
+      - name: Smoke test /api/health
+        run: |
+          echo "Esperando a que la app responda en http://localhost:${PORT}/api/health ..."
+          for i in $(seq 1 30); do
+            if curl -fsS "http://localhost:${PORT}/api/health" -m 5; then
+              echo "Smoke test OK"; break
+            fi
+            echo "Reintento $i/30..."; sleep 2
+          done
+          # Validar contenido esperado "ok": true
+          body=$(curl -fsS "http://localhost:${PORT}/api/health")
+          echo "Respuesta: $body"
+          echo "$body" | grep -q '"ok"\s*:\s*true' || { echo "Smoke test falló: respuesta inesperada" >&2; exit 1; }
+
+      - name: Install Newman (Postman CLI)
+        run: npm i -g newman
+
+      - name: Run Postman collection (integration tests)
+        run: |
+          newman run apiExpress.postman_collection.json \
+            --reporters cli \
+            --timeout-request 15000 \
+            --delay-request 100
+
+      - name: Publicar cobertura como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage/lcov-report
+            coverage/lcov.info
+            coverage/coverage-final.json
+          if-no-files-found: ignore
+
+      - name: App logs on failure
+        if: failure()
+        run: |
+          echo "Mostrando últimos logs de la app si están disponibles" || true
+          if [ -f app.pid ]; then
+            pid=$(cat app.pid)
+            echo "App PID: $pid"
+            ss -lntp || true
+          fi
+          echo "Logs de Docker Compose:" || true
+          docker compose logs --tail=200 || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          if [ -f app.pid ]; then
+            kill $(cat app.pid) || true
+          fi
+          docker compose down -v || true

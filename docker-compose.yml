@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: qualifica-mongodb
+    hostname: mongodb
+    restart: unless-stopped
+    volumes:
+      - mongodb-data:/data/db
+      - mongodb-log:/var/log/mongodb
+    env_file:
+      - .env.db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: qualifica-professor
+    ports:
+      - "27017:27017"
+    networks:
+      - qualifica-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mongodb-data:
+    driver: local
+    name: mongodb-data
+  mongodb-log:
+    driver: local
+    name: mongodb-log
+
+networks:
+  qualifica-network:
+    driver: bridge
+    name: qualifica-network
