@@ -1,0 +1,115 @@
+name: CI - Tests + Local SonarQube (Docker)
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  test-and-sonar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm install
+
+      - name: Run unit tests with coverage
+        run: |
+          npm run test:cov
+
+      - name: Start SonarQube in Docker
+        run: |
+          docker run -d --name sonarqube -p 9000:9000 -v sonarqube_data:/opt/sonarqube/data sonarqube:latest
+
+      - name: Wait for SonarQube to be UP
+        shell: bash
+        run: |
+          set -e
+          echo "Waiting for SonarQube health..."
+          for i in {1..60}; do
+            STATUS=$(curl -s http://localhost:9000/api/system/health | sed -n 's/.*"health":"\([A-Z]*\)".*/\1/p') || true
+            echo "Attempt $i - Health: $STATUS"
+            if [ "$STATUS" = "UP" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$STATUS" != "UP" ]; then
+            echo "SonarQube did not become UP in time" >&2
+            docker logs sonarqube || true
+            exit 1
+          fi
+
+      - name: Install curl and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl jq
+
+      - name: Initialize admin password (idempotent)
+        shell: bash
+        run: |
+          # Change default admin password if first run; ignore errors otherwise
+          curl -s -X POST -u admin:admin \
+            -d login=admin -d previousPassword=admin -d password=admin123 \
+            http://localhost:9000/api/users/change_password || true
+
+      - name: Generate SonarQube token for CI
+        id: token
+        shell: bash
+        run: |
+          RESP=$(curl -s -u admin:admin123 -X POST \
+            "http://localhost:9000/api/user_tokens/generate" \
+            -d name=ci-token -d type=USER_TOKEN || true)
+          echo "API response: $RESP"
+          TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+          if [ -z "$TOKEN" ]; then
+            echo "Token generation might have failed or already exists; trying to revoke and recreate..."
+            curl -s -u admin:admin123 -X POST "http://localhost:9000/api/user_tokens/revoke" -d name=ci-token || true
+            RESP=$(curl -s -u admin:admin123 -X POST \
+              "http://localhost:9000/api/user_tokens/generate" \
+              -d name=ci-token -d type=USER_TOKEN)
+            TOKEN=$(echo "$RESP" | jq -r '.token')
+          fi
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to obtain token" >&2
+            exit 1
+          fi
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Create project if not exists
+        shell: bash
+        run: |
+          curl -s -u admin:admin123 -X POST \
+            "http://localhost:9000/api/projects/create" \
+            -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor || true
+
+      - name: SonarQube Scan (npx sonar-scanner)
+        env:
+          SONAR_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          npx --yes sonar-scanner \
+            -Dsonar.host.url=http://localhost:9000 \
+            -Dsonar.token=${SONAR_TOKEN}
+
+      - name: Show SonarQube logs (last lines)
+        if: always()
+        run: |
+          docker logs --tail 200 sonarqube || true
+
+      - name: Tear down SonarQube
+        if: always()
+        run: |
+          docker stop sonarqube || true
+          docker rm sonarqube || true
+
