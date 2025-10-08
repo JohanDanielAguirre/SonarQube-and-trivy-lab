@@ -88,20 +88,20 @@ jobs:
       - name: Generate SonarQube token for CI (session-based with fallbacks)
         id: token
         shell: bash
-        env:
-          SONAR_USERNAME: ${{ secrets.SONAR_USERNAME }}
-          SONAR_PASSWORD: ${{ secrets.SONAR_PASSWORD }}
         run: |
           set -e
           COOKIE=/tmp/sonar_cookies.txt
           NAME="ci-token-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$(date +%s)"
 
-          # Build credential candidates: repo secrets first (if provided), then user-provided, then common defaults
+          # Opcional: si están definidas en el entorno (no secrets), se usan primero
           CANDIDATES=()
           if [ -n "${SONAR_USERNAME}" ] && [ -n "${SONAR_PASSWORD}" ]; then
             CANDIDATES+=("${SONAR_USERNAME}:${SONAR_PASSWORD}")
           fi
+          # Candidatos fijos (laboratorio)
           CANDIDATES+=(
+            "admin:Daniel1026"
+            "sonar:Daniel1026"
             "admin:Daniel1026."
             "sonar:Daniel1026."
             "admin:admin123"
@@ -131,24 +131,57 @@ jobs:
             exit 1
           fi
 
-          echo "Generating token name=${NAME} via /api/user_tokens/generate as ${AUTH_USER}..."
-          RESP=$(curl -sS -b "$COOKIE" -X POST \
+          echo "Generating token via Basic Auth (v1) as ${AUTH_USER}..."
+          RESP_FILE=/tmp/sonar_token_resp.json
+          CODE=$(curl -sS -u "$AUTH_USER:$AUTH_PASS" -X POST \
             -H 'Accept: application/json' \
-            http://localhost:9000/api/user_tokens/generate \
-            -d name=${NAME} -d type=USER_TOKEN || true)
+            -d name="${NAME}" \
+            -o "$RESP_FILE" -w "%{http_code}" \
+            http://localhost:9000/api/user_tokens/generate || true)
+          RESP=$(cat "$RESP_FILE" 2>/dev/null || true)
+          echo "HTTP $CODE (v1)"
           TOKEN=$(echo "$RESP" | jq -r '.token // empty')
 
           if [ -z "$TOKEN" ]; then
-            echo "Primary token endpoint returned empty; trying /api/v2/user_tokens/generate as fallback..."
-            RESP=$(curl -sS -b "$COOKIE" -X POST \
+            echo "v1 empty; trying Basic Auth (v2)..."
+            CODE=$(curl -sS -u "$AUTH_USER:$AUTH_PASS" -X POST \
               -H 'Content-Type: application/json' -H 'Accept: application/json' \
-              http://localhost:9000/api/v2/user_tokens/generate \
-              -d "{\"name\":\"${NAME}\"}" || true)
+              -d "{\"name\":\"${NAME}\"}" \
+              -o "$RESP_FILE" -w "%{http_code}" \
+              http://localhost:9000/api/v2/user_tokens/generate || true)
+            RESP=$(cat "$RESP_FILE" 2>/dev/null || true)
+            echo "HTTP $CODE (v2)"
             TOKEN=$(echo "$RESP" | jq -r '.token // empty')
           fi
 
           if [ -z "$TOKEN" ]; then
-            echo "Failed to obtain token via both endpoints" >&2
+            echo "Basic failed; trying cookie with XSRF token..."
+            XSRF=$(awk '$6=="XSRF-TOKEN" {print $7}' "$COOKIE" 2>/dev/null || true)
+            if [ -n "$XSRF" ]; then
+              CODE=$(curl -sS -b "$COOKIE" -X POST \
+                -H "X-XSRF-TOKEN: $XSRF" -H 'Accept: application/json' \
+                -d name="${NAME}" \
+                -o "$RESP_FILE" -w "%{http_code}" \
+                http://localhost:9000/api/user_tokens/generate || true)
+              RESP=$(cat "$RESP_FILE" 2>/dev/null || true)
+              echo "HTTP $CODE (cookie v1)"
+              TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+              if [ -z "$TOKEN" ]; then
+                CODE=$(curl -sS -b "$COOKIE" -X POST \
+                  -H "X-XSRF-TOKEN: $XSRF" -H 'Content-Type: application/json' -H 'Accept: application/json' \
+                  -d "{\"name\":\"${NAME}\"}" \
+                  -o "$RESP_FILE" -w "%{http_code}" \
+                  http://localhost:9000/api/v2/user_tokens/generate || true)
+                RESP=$(cat "$RESP_FILE" 2>/dev/null || true)
+                echo "HTTP $CODE (cookie v2)"
+                TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+              fi
+            fi
+          fi
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to obtain token via all tried methods" >&2
+            echo "Last HTTP: $CODE" >&2
             echo "Last response: $RESP" >&2
             exit 1
           fi
@@ -161,16 +194,31 @@ jobs:
         shell: bash
         run: |
           COOKIE=/tmp/sonar_cookies.txt
-          if [ -f "$COOKIE" ]; then
-            curl -s -b "$COOKIE" -X POST \
-              "http://localhost:9000/api/projects/create" \
-              -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor || true
-          else
-            echo "Cookie file not found, falling back to Basic auth"
-            curl -s -u "${{ steps.token.outputs.authUser }}:${{ steps.token.outputs.authPass }}" -X POST \
-              "http://localhost:9000/api/projects/create" \
-              -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor || true
+          XSRF=$(awk '$6=="XSRF-TOKEN" {print $7}' "$COOKIE" 2>/dev/null || true)
+          echo "Creating project (Basic first, then cookie)..."
+          set +e
+          CODE=$(curl -sS -u "${{ steps.token.outputs.authUser }}:${{ steps.token.outputs.authPass }}" -X POST \
+            -o /tmp/proj_resp.json -w "%{http_code}" \
+            "http://localhost:9000/api/projects/create" \
+            -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor)
+          if [ "$CODE" != "200" ] && [ "$CODE" != "201" ] && [ "$CODE" != "400" ] && [ "$CODE" != "409" ]; then
+            echo "Basic create project HTTP $CODE; trying with cookie..."
+            if [ -f "$COOKIE" ]; then
+              if [ -n "$XSRF" ]; then
+                CODE=$(curl -sS -b "$COOKIE" -X POST -H "X-XSRF-TOKEN: $XSRF" \
+                  -o /tmp/proj_resp.json -w "%{http_code}" \
+                  "http://localhost:9000/api/projects/create" \
+                  -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor)
+              else
+                CODE=$(curl -sS -b "$COOKIE" -X POST \
+                  -o /tmp/proj_resp.json -w "%{http_code}" \
+                  "http://localhost:9000/api/projects/create" \
+                  -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor)
+              fi
+            fi
           fi
+          echo "Create project HTTP $CODE"
+          set -e
 
       - name: SonarQube Scan (npx sonar-scanner)
         env:
