@@ -85,35 +85,92 @@ jobs:
             -d login=admin -d previousPassword=admin -d password=admin123 \
             http://localhost:9000/api/users/change_password || true
 
-      - name: Generate SonarQube token for CI
+      - name: Generate SonarQube token for CI (session-based with fallbacks)
         id: token
         shell: bash
+        env:
+          SONAR_USERNAME: ${{ secrets.SONAR_USERNAME }}
+          SONAR_PASSWORD: ${{ secrets.SONAR_PASSWORD }}
         run: |
-          RESP=$(curl -s -u admin:admin123 -X POST \
-            "http://localhost:9000/api/user_tokens/generate" \
-            -d name=ci-token -d type=USER_TOKEN || true)
-          echo "API response: $RESP"
-          TOKEN=$(echo "$RESP" | jq -r '.token // empty')
-          if [ -z "$TOKEN" ]; then
-            echo "Token generation might have failed or already exists; trying to revoke and recreate..."
-            curl -s -u admin:admin123 -X POST "http://localhost:9000/api/user_tokens/revoke" -d name=ci-token || true
-            RESP=$(curl -s -u admin:admin123 -X POST \
-              "http://localhost:9000/api/user_tokens/generate" \
-              -d name=ci-token -d type=USER_TOKEN)
-            TOKEN=$(echo "$RESP" | jq -r '.token')
+          set -e
+          COOKIE=/tmp/sonar_cookies.txt
+          NAME="ci-token-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$(date +%s)"
+
+          # Build credential candidates: repo secrets first (if provided), then user-provided, then common defaults
+          CANDIDATES=()
+          if [ -n "${SONAR_USERNAME}" ] && [ -n "${SONAR_PASSWORD}" ]; then
+            CANDIDATES+=("${SONAR_USERNAME}:${SONAR_PASSWORD}")
           fi
-          if [ -z "$TOKEN" ]; then
-            echo "Failed to obtain token" >&2
+          CANDIDATES+=(
+            "admin:Daniel1026."
+            "sonar:Daniel1026."
+            "admin:admin123"
+            "admin:admin"
+            "sonar:sonar"
+          )
+
+          AUTH_USER=""
+          AUTH_PASS=""
+
+          for C in "${CANDIDATES[@]}"; do
+            U="${C%%:*}"; P="${C#*:}"
+            echo "Trying session login with ${U}:********"
+            rm -f "$COOKIE"
+            curl -sS -c "$COOKIE" -X POST \
+              -d login="$U" -d password="$P" \
+              http://localhost:9000/api/authentication/login > /dev/null || true
+            AUTH=$(curl -sS -b "$COOKIE" http://localhost:9000/api/authentication/validate | jq -r '.valid // .isAuthenticated // empty')
+            echo "Auth valid? -> ${AUTH:-false}"
+            if [ "$AUTH" = "true" ]; then
+              AUTH_USER="$U"; AUTH_PASS="$P"; break
+            fi
+          done
+
+          if [ -z "$AUTH_USER" ]; then
+            echo "Failed to authenticate with provided and default credentials" >&2
             exit 1
           fi
+
+          echo "Generating token name=${NAME} via /api/user_tokens/generate as ${AUTH_USER}..."
+          RESP=$(curl -sS -b "$COOKIE" -X POST \
+            -H 'Accept: application/json' \
+            http://localhost:9000/api/user_tokens/generate \
+            -d name=${NAME} -d type=USER_TOKEN || true)
+          TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Primary token endpoint returned empty; trying /api/v2/user_tokens/generate as fallback..."
+            RESP=$(curl -sS -b "$COOKIE" -X POST \
+              -H 'Content-Type: application/json' -H 'Accept: application/json' \
+              http://localhost:9000/api/v2/user_tokens/generate \
+              -d "{\"name\":\"${NAME}\"}" || true)
+            TOKEN=$(echo "$RESP" | jq -r '.token // empty')
+          fi
+
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to obtain token via both endpoints" >&2
+            echo "Last response: $RESP" >&2
+            exit 1
+          fi
+
           echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "authUser=$AUTH_USER" >> $GITHUB_OUTPUT
+          echo "authPass=$AUTH_PASS" >> $GITHUB_OUTPUT
 
       - name: Create project if not exists
         shell: bash
         run: |
-          curl -s -u admin:admin123 -X POST \
-            "http://localhost:9000/api/projects/create" \
-            -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor || true
+          COOKIE=/tmp/sonar_cookies.txt
+          if [ -f "$COOKIE" ]; then
+            curl -s -b "$COOKIE" -X POST \
+              "http://localhost:9000/api/projects/create" \
+              -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor || true
+          else
+            echo "Cookie file not found, falling back to Basic auth"
+            curl -s -u "${{ steps.token.outputs.authUser }}:${{ steps.token.outputs.authPass }}" -X POST \
+              "http://localhost:9000/api/projects/create" \
+              -d project=qualifica-o-seu-professor -d name=qualifica-o-seu-professor || true
+          fi
 
       - name: SonarQube Scan (npx sonar-scanner)
         env:
